@@ -10,3 +10,5 @@ WORKERS var is the number of connection it create with single file to download
 by this i was able to get 
 6 to 7 MB/s(free account) on usa and Japan server by using protonvpn
 
+
+pip install requests tqdm
