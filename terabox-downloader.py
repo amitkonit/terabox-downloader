@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 
+WORKERS = 32
+
 class TeraDownloader:
     def __init__(self, cookie_string):
         self.base_url = "https://www.1024terabox.com"
@@ -168,7 +170,7 @@ class TeraDownloader:
                 files.append(i)
         return files
 
-    def download(self, file_obj, max_workers=16):
+    def download(self, file_obj, max_workers=WORKERS):
         name = file_obj['server_filename']
         size = int(file_obj['size'])
         dlink = file_obj['dlink']
