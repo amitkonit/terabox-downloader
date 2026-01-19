@@ -22,3 +22,10 @@ lib required for async
 ```
 pip install aiosqlite aiohttp aiofiles tqdm
 ```
+
+# Don't forget to fill the cookies
+```python
+if __name__ == "__main__":
+    # --- PASTE COOKIES HERE ---
+    COOKIES = "ndus=xxxx"
+```
