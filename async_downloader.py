@@ -11,10 +11,12 @@ from aiohttp import ClientTimeout, TCPConnector
 from yarl import URL
 from tqdm.asyncio import tqdm
 
-# --- CONFIGURATION ---
 DB_NAME = "download_history.db"
 MAX_CONCURRENT_CHUNKS = 16
-CHUNK_SIZE_MB = 1 
+CHUNK_SIZE_MB = 1
+
+class LinkExpiredError(Exception):
+    pass
 
 class DownloadTracker:
     def __init__(self):
@@ -128,7 +130,6 @@ class AsyncTeraDownloader:
         return False
 
     async def init_share(self, session, url):
-        """Step 1: Get Auth Params (shareid, uk, sign) ONLY."""
         key = url.strip().split()[0]
         if "/s/" in key: key = key.split("/s/")[-1].split("?")[0]
         if "surl=" in key: key = key.split("surl=")[-1].split("&")[0]
@@ -159,10 +160,6 @@ class AsyncTeraDownloader:
         return True
 
     async def fetch_list(self, session, path, is_root=False):
-        """
-        Step 2: Get File List with ROBUST RETRY LOGIC.
-        Handles 400141 (Risk) and 4000020 (Token Expired).
-        """
         async with self.sem_api:
             ref_path = f"&path={urllib.parse.quote(path)}" if path != "/" else ""
             headers = self.headers.copy()
@@ -177,7 +174,6 @@ class AsyncTeraDownloader:
             if is_root: params['root'] = '1'
             else: params['dir'] = path
 
-            # RETRY LOOP
             attempt = 0
             while True:
                 try:
@@ -187,7 +183,6 @@ class AsyncTeraDownloader:
                         if errno == 0:
                             return data.get('list', [])
 
-                        # RETRYABLE ERRORS
                         if errno in [4000020, 400141]:
                             backoff = min(2 ** attempt, 20)
                             if errno == 400141:
@@ -210,7 +205,6 @@ class AsyncTeraDownloader:
                     attempt += 1
 
     async def recursive_scan(self, session, path="/", is_root=True):
-        """Recursively scans folders and builds a flat list of files."""
         if is_root: print("[*] Scanning Root...")
         else: print(f"   [+] Scanning: {path}")
 
@@ -233,18 +227,35 @@ class AsyncTeraDownloader:
                 
         return files
 
+    async def refresh_file_link(self, session, file_obj):
+        print(f"\n   [↻] Link expired for: {file_obj['server_filename']}. Refreshing...")
+        full_path = file_obj['path']
+        parent_dir = os.path.dirname(full_path)
+        if not parent_dir: parent_dir = "/"
+        
+        items = await self.fetch_list(session, parent_dir, is_root=(parent_dir == "/"))
+        for item in items:
+            if item['fs_id'] == file_obj['fs_id']:
+                return item['dlink']
+        
+        print(f"   [!] Could not find file {file_obj['server_filename']} during refresh.")
+        return None
+
     async def download_chunk(self, session, url, start, end, local_path, file_id, pbar):
         async with self.sem_download:
             headers = self.headers.copy()
             headers['Range'] = f'bytes={start}-{end}'
             
-            attempts = 10
+            attempts = 5
             backoff = 2
             
             while attempts > 0:
                 try:
                     async with session.get(url, headers=headers, timeout=40) as resp:
-                        if resp.status in [403, 401]: raise Exception(f"HTTP {resp.status}")
+                        if resp.status == 403:
+                            raise LinkExpiredError("403 Forbidden")
+                        if resp.status in [401, 410]:
+                             raise Exception(f"HTTP {resp.status}")
                         resp.raise_for_status()
                         
                         async with aiofiles.open(local_path, mode='r+b') as f:
@@ -255,6 +266,8 @@ class AsyncTeraDownloader:
                         
                         await self.tracker.mark_chunk_done(file_id, start, end)
                         return True
+                except LinkExpiredError:
+                    raise
                 except Exception:
                     attempts -= 1
                     if attempts == 0: return False
@@ -264,27 +277,21 @@ class AsyncTeraDownloader:
 
     async def download(self, session, file_obj):
         name = file_obj['server_filename']
-        # Sanitize name
         name = re.sub(r'[\\/*?:"<>|]', "", name)
         size = int(file_obj['size'])
-        dlink = file_obj['dlink']
         
-        # Local Path
         local_path = file_obj['path'].lstrip('/') if 'path' in file_obj else name
         local_dir = os.path.dirname(local_path)
         if local_dir and not os.path.exists(local_dir): os.makedirs(local_dir, exist_ok=True)
 
-        # 1. Check DB
         file_id, is_in_db = await self.tracker.get_file_status(local_path)
         file_on_disk = os.path.exists(local_path)
         disk_size = os.path.getsize(local_path) if file_on_disk else 0
 
-        # 2. Skip if done
         if not is_in_db and file_on_disk and disk_size == size:
             print(f"[#] Skipping {name} (Complete)")
             return
 
-        # 3. Init / Resume
         if not is_in_db:
             print(f"\n[+] Starting: {name} ({size/1024/1024:.2f} MB)")
             file_id = await self.tracker.register_file(local_path, size)
@@ -298,41 +305,60 @@ class AsyncTeraDownloader:
             else:
                 print(f"\n[+] Resuming: {name}")
 
-        # 4. Chunking
-        chunk_size = CHUNK_SIZE_MB * 512 * 512
+        chunk_size = CHUNK_SIZE_MB * 1024 * 1024
         all_ranges = []
         for i in range(0, size, chunk_size):
             end = min(i + chunk_size - 1, size - 1)
             all_ranges.append((i, end))
 
-        completed_chunks = await self.tracker.get_completed_chunks(file_id)
-        completed_starts = set(r[0] for r in completed_chunks)
-        needed_ranges = [r for r in all_ranges if r[0] not in completed_starts]
-        
-        if not needed_ranges:
-            print("    [+] Verification Complete.")
-            await self.tracker.cleanup_file(file_id)
-            return
+        max_link_refreshes = 3
+        refresh_count = 0
 
-        bytes_to_download = sum((r[1] - r[0] + 1) for r in needed_ranges)
-        initial = size - bytes_to_download
+        while refresh_count < max_link_refreshes:
+            completed_chunks = await self.tracker.get_completed_chunks(file_id)
+            completed_starts = set(r[0] for r in completed_chunks)
+            needed_ranges = [r for r in all_ranges if r[0] not in completed_starts]
+            
+            if not needed_ranges:
+                print("    [+] Verification Complete.")
+                await self.tracker.cleanup_file(file_id)
+                return
 
-        pbar = tqdm(total=size, initial=initial, unit='B', unit_scale=True, ncols=80, desc=name[:15])
+            bytes_to_download = sum((r[1] - r[0] + 1) for r in needed_ranges)
+            initial = size - bytes_to_download
+            pbar = tqdm(total=size, initial=initial, unit='B', unit_scale=True, ncols=80, desc=name[:15])
 
-        tasks = [self.download_chunk(session, dlink, s, e, local_path, file_id, pbar) for s, e in needed_ranges]
-        results = await asyncio.gather(*tasks)
-        pbar.close()
-        
-        if all(results):
-            await self.tracker.cleanup_file(file_id)
-            print(f"[SUCCESS] {name}")
-        else:
-            print(f"[!] {name} Failed/Interrupted.")
+            try:
+                tasks = [self.download_chunk(session, file_obj['dlink'], s, e, local_path, file_id, pbar) for s, e in needed_ranges]
+                results = await asyncio.gather(*tasks)
+                pbar.close()
+                
+                if all(results):
+                    await self.tracker.cleanup_file(file_id)
+                    print(f"[SUCCESS] {name}")
+                    return
+                else:
+                    print(f"[!] {name} incomplete (Network/IO Error).")
+                    return
+
+            except LinkExpiredError:
+                pbar.close()
+                refresh_count += 1
+                new_dlink = await self.refresh_file_link(session, file_obj)
+                if new_dlink:
+                    file_obj['dlink'] = new_dlink
+                    continue 
+                else:
+                    print(f"[-] Failed to refresh link for {name}. Aborting.")
+                    return
+            except Exception as e:
+                pbar.close()
+                print(f"[-] Critical error downloading {name}: {e}")
+                return
 
 async def main():
-    # COOKIES
     COOKIES = "ndus=xxxx"
-    
+
     dl = AsyncTeraDownloader(COOKIES)
     await dl.tracker.init()
     
