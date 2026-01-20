@@ -299,7 +299,7 @@ class AsyncTeraDownloader:
                 print(f"\n[+] Resuming: {name}")
 
         # 4. Chunking
-        chunk_size = CHUNK_SIZE_MB * 1024 * 1024 
+        chunk_size = CHUNK_SIZE_MB * 512 * 512
         all_ranges = []
         for i in range(0, size, chunk_size):
             end = min(i + chunk_size - 1, size - 1)
