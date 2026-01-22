@@ -61,7 +61,7 @@ class DownloadTracker:
 
 class AsyncTeraDownloader:
     def __init__(self, cookie_string):
-        self.base_url = "https://www.1024terabox.com"
+        self.base_url = "https://dm.terabox.app" #if not work then use 1024terabox.com 
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
